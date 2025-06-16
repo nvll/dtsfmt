@@ -192,7 +192,7 @@ fn traverse(
 
             // Node closing
             print_indent(writer, ctx);
-            writer.push_str("};\n");
+            writer.push_str("};\n\n");
             cursor.goto_parent();
         }
         "property" => {
@@ -212,9 +212,17 @@ fn traverse(
                 };
 
                 match cursor.node().kind() {
-                    "," => writer.push_str(", "),
-                    "=" => writer.push_str(" = "),
-                    ";" => break,
+                    "," => {
+                        writer.push_str(",\n");
+                        print_indent(writer, &ctx);
+                        writer.push_str(" ".repeat(name.chars().count() + 3 + 2).as_str());
+                    },
+                    "=" => {
+                        writer.push_str(" = ");
+                    },
+                    ";" => {
+                        break;
+                    }
                     _ => traverse(writer, source, cursor, &ctx),
                 }
             }
@@ -249,7 +257,8 @@ fn traverse(
                         if first {
                             first = false;
                         } else {
-                            writer.push(' ');
+                            writer.push_str("\n");
+                            print_indent(writer, &ctx.inc(2));
                         }
 
                         writer.push_str(get_text(source, cursor));
