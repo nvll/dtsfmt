@@ -1,5 +1,6 @@
-use std::collections::VecDeque;
+use std::{collections::VecDeque, os::fd::AsRawFd};
 
+use similar::{iter, DiffableStr};
 use tree_sitter::TreeCursor;
 
 use crate::{
@@ -25,6 +26,9 @@ fn traverse(
     let node = cursor.node();
 
     match node.kind() {
+        "file_version" => {
+            writer.push_str(&format!("{}\n\n", get_text(source, cursor)));
+        }
         "comment" => {
             // Add a newline before the comment if the previous node is not a comment
             if lookbehind(cursor).is_some_and(|n| n.kind() != "comment") {
@@ -150,17 +154,8 @@ fn traverse(
                 writer.push('\n');
             }
         }
-        "identifier" => {
+        "identifier" | "unit_address" => {
             writer.push_str(get_text(source, cursor));
-            // Identifier itself only contains the token string so we need to
-            // peek forward to see if we're a label or a node name.
-            if let Some(n) = lookahead(cursor) {
-                match n.kind() {
-                    ":" => writer.push_str(": "),
-                    "{" => writer.push_str(" {\n"),
-                    _ => (),
-                };
-            }
         }
         "node" => {
             // A node will typically have children in a format of:
@@ -227,7 +222,46 @@ fn traverse(
         "string_literal" => {
             writer.push_str(get_text(source, cursor));
         }
+        "byte_string_literal" => {
+            // The tree-sitter-devicetree grammer only exposes byte literals as
+            // text, the actual contents are hidden from the syntax tree
+            // generated. This means we need to parse out the numbers from the
+            // string.
+            // XXX: Get the previous identifer source somehow?
+            let hex_string = get_text(source, cursor);
+            // Trim the [ and ] off of the source string we obtained.
+            let hex_bytes = hex_string[1..hex_string.len() - 1]
+                .split_whitespace()
+                .collect::<Vec<&str>>();
+            let hex_chunks = hex_bytes.chunks(16).collect::<Vec<&[&str]>>();
+
+            // For smaller byte chunks it reads better if we just one line
+            // everything, but for anything beyond 16 bytes we split it into
+            // multiple lines.
+            if hex_chunks.len() == 1 {
+                writer.push_str(&format!("[{}]", hex_chunks[0].join(" ")));
+            } else {
+                writer.push_str("[\n");
+                let ctx = ctx.inc(1);
+                for (i, &line) in hex_chunks.iter().enumerate() {
+                    print_indent(writer, &ctx.inc(1));
+                    writer.push_str(&format!("{}\n", &line.join(" ")));
+                    if i == hex_chunks.len() - 1 {
+                        print_indent(writer, &ctx);
+                        writer.push_str("]");
+                    }
+                }
+            }
+        }
+
         "integer_cells" => {
+            eprintln!(
+                "Found type '{}' with {} {} source: '{}'",
+                node.kind(),
+                node.child_count(),
+                if node.child_count() == 1 { "child" } else { "children" },
+                get_text(source, cursor)
+            );
             cursor.goto_first_child();
 
             // Keymap bindings are a special snowflake
@@ -257,14 +291,32 @@ fn traverse(
             writer.push('>');
             cursor.goto_parent();
         }
+        // "@" | "[" | "]" => {
+        //     writer.push_str(get_text(source, cursor));
+        // }
+        // These are all straightforward, but need to handle spacing and newlines around themselves.
         "}" => {
             print_indent(writer, &ctx.dec(1));
             writer.push('}');
+        }
+        "{" => {
+            writer.push_str(" {\n");
+        }
+        ":" => {
+            writer.push_str(": ");
         }
         ";" => {
             writer.push_str(";\n");
         }
         _ => {
+            // eprintln!(
+            //     "Found type '{}' with {} {} source: '{}'",
+            //     node.kind(),
+            //     node.child_count(),
+            //     if node.child_count() == 1 { "child" } else { "children" },
+            //     get_text(source, cursor)
+            // );
+            // Since we're unsure of this node just traverse its children
             if cursor.goto_first_child() {
                 traverse(writer, source, cursor, ctx);
 
@@ -387,6 +439,7 @@ fn print_bindings(
 pub fn print(source: &String, layout: &KeyboardLayoutType) -> String {
     let mut writer = String::new();
     let tree = parse(source.clone());
+    // tree.print_dot_graph(&std::io::stdout().as_raw_fd());
     let mut cursor = tree.walk();
 
     let layout = layouts::get_layout(layout);
