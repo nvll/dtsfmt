@@ -1,18 +1,13 @@
 use std::collections::VecDeque;
 
-use tree_sitter::TreeCursor;
+use tree_sitter::{Node, TreeCursor};
 
 use crate::config::Config;
-use crate::context::Context;
+use crate::context::{self, Context};
 use crate::layouts;
 use crate::parser::parse;
 use crate::utils::{
-    get_text,
-    lookahead,
-    lookbehind,
-    pad_right,
-    print_indent,
-    sep,
+    get_text, lookahead, lookbehind, pad_right, print_indent, sep,
 };
 
 fn is_preproc(n: &tree_sitter::Node) -> bool {
@@ -20,6 +15,81 @@ fn is_preproc(n: &tree_sitter::Node) -> bool {
         || n.kind() == "preproc_ifdef"
         || n.kind() == "preproc_def"
         || n.kind() == "preproc_function_def"
+}
+
+fn extract_cells_value(source: &String, node: &Node) -> Option<u32> {
+    // A property with a single integer literal will have the format of:
+    // 'identifier>' = 'integer_cells'
+    //                         → < 'integer_literal' >
+    // Conveniently, this means we know exactly which named child contains the value needed.
+    let s = get_text(
+        source,
+        &mut node.named_child(1).unwrap().named_child(0).unwrap().walk(),
+    );
+
+    // Per spec, the value can be either hex or an int.
+    if s.starts_with("0x") {
+        u32::from_str_radix(s.strip_prefix("0x").unwrap(), 16).ok()
+    } else {
+        u32::from_str_radix(s, 10).ok()
+    }
+}
+
+fn parse_address_and_size_cells<'a, 'b>(
+    source: &String,
+    node: &Node,
+) -> (Option<u32>, Option<u32>) {
+    let mut cursor = node.walk();
+    let mut address_cells = None;
+    let mut size_cells = None;
+
+    let properties: Vec<Node> = node
+        .named_children(&mut cursor)
+        .filter(|c| c.kind() == "property")
+        .collect();
+    for property in properties {
+        let identifier =
+            get_text(source, &mut property.named_child(0).unwrap().walk());
+        match identifier {
+            "#address-cells" => {
+                address_cells = extract_cells_value(source, &property)
+            }
+            "#size-cells" => {
+                size_cells = extract_cells_value(source, &property)
+            }
+            _ => (),
+        }
+    }
+    (address_cells, size_cells)
+}
+
+fn print_int_strs(
+    writer: &mut String,
+    int_strs: &[&str],
+    chunk_size: u32,
+    ctx: &Context,
+) {
+    let chunks: Vec<&[&str]> = int_strs.chunks(chunk_size as usize).collect();
+    // For smaller byte chunks it reads better if we just one line
+    // everything, but for anything beyond 16 bytes we split it into
+    // multiple lines.
+    if chunks.len() == 1 {
+        writer.push_str(&chunks[0].join(" "));
+    } else {
+        for (i, &chunk) in chunks.iter().enumerate() {
+            if i != 0 {
+                print_indent(writer, &ctx);
+                // This aligns us to just after the initial [ or < based on the length of the identifier and " ="
+                writer.push_str(
+                    &" ".repeat(ctx.identifier.unwrap_or("").len() + 2),
+                );
+            }
+            writer.push_str(&chunk.join(" "));
+            if i != chunks.len() - 1 {
+                writer.push('\n');
+            }
+        }
+    }
 }
 
 fn traverse(
@@ -160,12 +230,18 @@ fn traverse(
                 writer.push('\n');
             }
         }
-        "identifier" | "string_literal" | "unit_address" => {
+        "identifier" | "integer_literal" | "string_literal"
+        | "unit_address" => {
             writer.push_str(get_text(source, cursor));
         }
-        // This is a general handler for any type that just needs to traverse
-        // its children.
+        // Node and Property are handled togetherb due to shared handling of
+        // identifiers and indentation of children.
         "node" | "property" => {
+            // Check for any #address-cells or #size-cells properties in this
+            // mode before descending since they affect child parsing.
+            let (address_cells, size_cells) =
+                parse_address_and_size_cells(source, &node);
+
             // A node will typically have children in a format of:
             // [<identifier>:] [&]<identifier> { [nodes and properties] }
             cursor.goto_first_child();
@@ -177,10 +253,19 @@ fn traverse(
                 print_indent(writer, ctx);
             }
 
-            // Increment the indentation for children and also check whether
-            // we've identified a node keymap node for Zephyr-specific keymaps.
-            let ctx = ctx.inc(1);
-            let ctx = match get_text(source, cursor) {
+            // Update the context before we traverse children. We always need to
+            // indent once per level, and then if we found a more local
+            // #address-cells or #size-cells value we want to carry it with us
+            // because it takes effect for children of the node they are present
+            // in.
+            let identifier = get_text(source, cursor);
+            let ctx = ctx
+                .with_identifier(identifier)
+                .with_address_cells(address_cells.unwrap_or(ctx.address_cells))
+                .with_size_cells(size_cells.unwrap_or(ctx.size_cells))
+                .inc(1);
+            // Update whether we've seen Zephyr-shaped identifiers.
+            let ctx = match identifier {
                 "keymap" => ctx.keymap(),
                 "bindings" => ctx.bindings(),
                 _ => ctx,
@@ -206,58 +291,34 @@ fn traverse(
         "byte_string_literal" => {
             let hex_string = get_text(source, cursor);
             // Trim the [ and ] off of the source string we obtained.
-            let hex_bytes = hex_string[1..hex_string.len() - 1]
+            let children = hex_string[1..hex_string.len() - 1]
                 .split_whitespace()
                 .collect::<Vec<&str>>();
-            let hex_chunks = hex_bytes.chunks(16).collect::<Vec<&[&str]>>();
-
-            // For smaller byte chunks it reads better if we just one line
-            // everything, but for anything beyond 16 bytes we split it into
-            // multiple lines.
-            if hex_chunks.len() == 1 {
-                writer.push_str(&format!("[{}]", hex_chunks[0].join(" ")));
-            } else {
-                writer.push_str("[\n");
-                for (i, &line) in hex_chunks.iter().enumerate() {
-                    print_indent(writer, ctx);
-                    writer.push_str(&format!("{}\n", &line.join(" ")));
-                    if i == hex_chunks.len() - 1 {
-                        print_indent(writer, &ctx.dec(1));
-                        writer.push(']');
-                    }
-                }
-            }
+            writer.push('[');
+            print_int_strs(writer, &children, 16, ctx);
+            writer.push(']');
         }
 
         "integer_cells" => {
-            cursor.goto_first_child();
+            let chunk_size = match &ctx.identifier {
+                Some("reg") => ctx.address_cells + ctx.size_cells,
+                _ => 16,
+            };
 
             // Keymap bindings are a special snowflake
             if ctx.has_zephyr_syntax() {
+                cursor.goto_first_child();
                 print_bindings(writer, source, cursor, ctx);
                 return;
             }
 
+            let children: Vec<&str> = node
+                .named_children(&mut node.walk())
+                .map(|n| get_text(source, &mut n.walk()))
+                .collect();
             writer.push('<');
-            let mut first = true;
-
-            while cursor.goto_next_sibling() {
-                match cursor.node().kind() {
-                    ">" => break,
-                    _ => {
-                        if first {
-                            first = false;
-                        } else {
-                            writer.push(' ');
-                        }
-
-                        writer.push_str(get_text(source, cursor));
-                    }
-                }
-            }
-
+            print_int_strs(writer, &children, chunk_size, &ctx);
             writer.push('>');
-            cursor.goto_parent();
         }
         // All the non-named grammatical tokens that are emitted but handled
         // simply with some output structure.
@@ -418,8 +479,15 @@ pub fn print(source: &String, config: &Config) -> String {
     let tree = parse(source.clone());
     let mut cursor = tree.walk();
 
-    let ctx =
-        Context { indent: 0, bindings: false, keymap: false, config: config };
+    let ctx = Context {
+        indent: 0,
+        keymap: false,
+        bindings: false,
+        identifier: None,
+        address_cells: context::ADDRESS_CELLS_DEFAULT,
+        size_cells: context::SIZE_CELLS_DEFAULT,
+        config,
+    };
 
     // The first node is the root document node, so we have to traverse all it's
     // children with the same indentation level.

@@ -8,7 +8,7 @@ use crate::layouts::KeyboardLayoutType;
 
 mod constants;
 
-#[derive(Default, Deserialize, TypedBuilder)]
+#[derive(Debug, Default, Deserialize, TypedBuilder)]
 pub struct Config {
     #[builder(default)]
     #[serde(default)]
